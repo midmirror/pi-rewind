@@ -1,6 +1,7 @@
 // index.ts — pi-rewind 扩展入口
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { mkdir } from "node:fs/promises";
+import path from "node:path";
 import { SnapshotEngine } from "./src/snapshot.js";
 import type { SessionEntry as RewindSessionEntry, RestoreContext } from "./src/session.js";
 import { executeRewind, parseArgv } from "./src/command.js";
@@ -65,10 +66,11 @@ export default function init(pi: ExtensionAPI) {
   pi.on("tool_execution_start", async (event, ctx) => {
     if (!engine) return;
     if (event.toolName !== "edit" && event.toolName !== "write") return;
-    const path = (event.args as { path?: unknown } | undefined)?.path;
-    if (typeof path !== "string" || path.length === 0) return;
+    const filePath = (event.args as { path?: unknown } | undefined)?.path;
+    if (typeof filePath !== "string" || filePath.length === 0) return;
     const cwd = ctx.sessionManager.getCwd();
-    const abs = path.startsWith("/") || /^[A-Za-z]:[\\/]/.test(path) ? path : `${cwd}/${path}`;
+    const abs =
+      filePath.startsWith("/") || /^[A-Za-z]:[\\/]/.test(filePath) ? filePath : path.join(cwd, filePath);
     try {
       await engine.trackEdit(abs);
       const latest = engine.getLatest();

@@ -191,6 +191,52 @@ describe("makeSnapshot", () => {
     expect(seqs).not.toContain(1);
     await rm(cwd, { recursive: true, force: true });
   });
+
+  it("Critical: backup:null 卡死修复——null→创建→二次编辑→恢复全链路", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-rewind-test-"));
+    const backupDir = join(cwd, ".backups");
+    await mkdir(join(cwd, "src"), { recursive: true });
+    const file = join(cwd, "src/c.ts");
+    const key = toTrackingKey(cwd, file);
+    const engine = new SnapshotEngine({ backupDir, cwd });
+
+    // u1: 空快照，c.ts 尚不存在
+    engine.hydrate([{ referencedMessageId: "u1", seq: 1, timestamp: 1, files: {} }]);
+    const u1 = engine.getLatest()!;
+
+    // write 前触发 trackEdit：文件不存在 → 记录 backup:null（旧 bug 会在此永久卡死）
+    await engine.trackEdit(file);
+    expect(engine.getLatest()!.files[key]?.backup).toBeNull();
+
+    // 模拟 write 工具落盘
+    await writeFile(file, "C1");
+    const u2 = await engine.makeSnapshot("u2");
+
+    // 关键断言：null 被 makeSnapshot 重评估推进为 v1，而非继续复用 null
+    expect(u2.files[key]?.backup).not.toBeNull();
+    expect(u2.files[key]!.backup).toMatch(/@v1$/);
+    const u2BakContent = await readFile(join(backupDir, u2.files[key]!.backup!), "utf-8");
+    expect(u2BakContent).toBe("C1");
+
+    // 模拟二次编辑：trackEdit 幂等判断需放行（已跟踪但此刻已非 null）——
+    // 此处 latest.files[key].backup 已是 v1，非 null，trackEdit 应跳过（不重复备份 C1 版本）
+    await engine.trackEdit(file);
+    expect(engine.getLatest()!.files[key]!.backup).toBe(u2.files[key]!.backup);
+
+    await writeFile(file, "C2");
+    const u3 = await engine.makeSnapshot("u3");
+    expect(u3.files[key]!.backup).toMatch(/@v2$/);
+
+    // 恢复 u2：应还原为 C1，不得因残留 null 语义误删
+    await engine.applySnapshot(u2);
+    expect(await readFile(file, "utf-8")).toBe("C1");
+
+    // 恢复 u1：u1 时点 c.ts 确实不存在 → 正确删除
+    await engine.applySnapshot(u1);
+    expect(await fileExists(file)).toBe(false);
+
+    await rm(cwd, { recursive: true, force: true });
+  });
 });
 
 describe("applySnapshot", () => {

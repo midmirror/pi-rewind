@@ -155,7 +155,11 @@ export class SnapshotEngine {
     const key = toTrackingKey(this.cwd, filePath);
     const latest = this.snapshots.at(-1);
     if (!latest) return; // 尚无快照，无从挂载（首个用户消息的快照会先建）
-    if (latest.files[key]) return; // 已在最近快照跟踪
+    // 幂等跳过条件：已跟踪且非 null。null 记录（彼时文件不存在）必须继续走备份流程重评估，
+    // 否则文件被创建后 null 状态永久卡死，恢复该点之后的快照会误删已创建文件（Critical 修复）。
+    // 注意：未跟踪（undefined）不能命中这个跳过条件，否则失去首次备份。
+    const existing = latest.files[key];
+    if (existing !== undefined && existing.backup !== null) return;
 
     let sizeOver = false;
     if (this.maxFileSizeBytes > 0) {
@@ -192,7 +196,12 @@ export class SnapshotEngine {
         Object.entries(prev.files).map(async ([key, desc]) => {
           const abs = toAbsolutePath(this.cwd, key);
           if (desc.backup === null) {
-            files[key] = desc;
+            // null 记录不可直接沿用：磁盘现状可能已变化（文件后来被创建）。
+            // 重新评估磁盘：存在 → 补建真实备份（版本号以 maxExistingVersion 扫描为准，通常 v1）；
+            // 仍不存在 → 保持 null（Critical 修复：防止 null 永久卡死导致恢复时误删文件）。
+            const nextVersion = (await maxExistingVersion(this.backupDir, abs)) + 1;
+            const name = await backupFile(abs, this.backupDir, nextVersion);
+            files[key] = { backup: name };
             return;
           }
           const bakPath = join(this.backupDir, desc.backup);
