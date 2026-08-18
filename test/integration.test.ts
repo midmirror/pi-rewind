@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { makeContext } from "./harness.js";
+import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { makeContext, makeEventHarness } from "./harness.js";
 import { getSelectableUserEntries, runSessionRestore } from "../src/session.js";
 import type { SessionEntry } from "../src/session.js";
 
@@ -42,5 +45,37 @@ describe("session integration", () => {
     await runSessionRestore(ctx, { entryId: "u1", text: "only prompt", parentId: null });
     expect(navigations).toEqual([]); // 未导航
     expect(notifications.some((n) => n.includes("/tree"))).toBe(true);
+  });
+});
+
+describe("event flow", () => {
+  it("消息→编辑→恢复全链路", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-rw-ev-"));
+    const backupDir = join(cwd, ".backups");
+    const file = join(cwd, "src/a.ts");
+    await mkdir(join(cwd, "src"), { recursive: true });
+    await writeFile(file, "V1\n");
+    const h = makeEventHarness({ cwd, backupDir });
+
+    await h.onMessageEndUser("u1"); // 快照1：a.ts=V1
+    await h.onToolExecStart("edit", { path: file }); // 编辑前备份 v1
+    await writeFile(file, "V2\n"); // 模拟 edit 落盘
+    await h.onMessageEndUser("u2"); // 快照2：a.ts=V2
+    await h.onToolExecStart("write", { path: file });
+    await writeFile(file, "V3\n");
+
+    // 恢复到 u1
+    const snap1 = h.entriesStore
+      .getEntries()
+      .find((e) => e.customType === "pi-rewind-snapshot" && (e.data as any).referencedMessageId === "u1");
+    expect(snap1).toBeDefined();
+    await h.engine.applySnapshot(snap1!.data as any);
+    expect(await readFile(file, "utf-8")).toBe("V1\n");
+    // 快照 2 的 files 自包含：u1 的 a.ts 缺跟踪时由 v1 回退兜底
+    const snap2 = h.entriesStore
+      .getEntries()
+      .find((e) => e.customType === "pi-rewind-snapshot" && (e.data as any).referencedMessageId === "u2");
+    expect(Object.keys((snap2!.data as any).files).length).toBeGreaterThan(0);
+    await rm(cwd, { recursive: true, force: true });
   });
 });
