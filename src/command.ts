@@ -44,6 +44,7 @@ async function resolveTarget(
   if (opts.target.kind === "at") {
     // --at 支持两种寻址：数字=第 N 条可回退用户消息（1 起）；非数字=entryId 前缀
     const value = opts.target.value;
+    if (!value || !value.trim()) return undefined; // 缺值（如 `/rewind --at` 漏填）→ 不可解析，走「无可回退」提示，不静默匹配
     const n = Number(value);
     if (Number.isInteger(n) && n >= 1) {
       ref = refs[n - 1];

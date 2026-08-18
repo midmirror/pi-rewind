@@ -23,6 +23,12 @@ describe("parseArgv", () => {
       target: { kind: "last" }, mode: "both", confirm: false, dryRun: false,
     });
   });
+
+  it("--at 漏填值时 value 为空字符串（resolveTarget 层负责拒绝）", () => {
+    expect(parseArgv("--at")).toEqual({
+      target: { kind: "at", value: "" }, mode: "both", confirm: false, dryRun: false,
+    });
+  });
 });
 
 describe("executeRewind", () => {
@@ -49,6 +55,28 @@ describe("executeRewind", () => {
     );
     expect(await readFile(file, "utf-8")).toBe("A1\n");
     expect(lines.some((l) => l.includes("rewind-done"))).toBe(true);
+    await rm(cwd, { recursive: true, force: true });
+  });
+
+  it("--at 空值不静默匹配第一条消息，不执行恢复", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-rw-cmd-"));
+    const backupDir = join(cwd, ".backups");
+    const file = join(cwd, "src/a.ts");
+    await mkdir(join(cwd, "src"), { recursive: true });
+    await writeFile(file, "A1\n");
+    const engine = new SnapshotEngine({ backupDir, cwd });
+    await engine.makeSnapshot("u1");
+    await engine.trackEdit(file);
+    await writeFile(file, "A2\n");
+    const lines: string[] = [];
+    const entries: SessionEntry[] = [userEntry("u1", null, "改 a.ts")];
+    const { ctx } = makeContext(entries);
+    await executeRewind(
+      { engine, entries, ctx, ctxOutput: (s) => lines.push(s) },
+      { target: { kind: "at", value: "" }, mode: "code", confirm: true, dryRun: false },
+    );
+    expect(await readFile(file, "utf-8")).toBe("A2\n"); // 未执行恢复，磁盘内容不变
+    expect(lines.some((l) => l.includes("rewind-done"))).toBe(false);
     await rm(cwd, { recursive: true, force: true });
   });
 

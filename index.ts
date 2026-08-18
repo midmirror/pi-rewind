@@ -58,23 +58,24 @@ export default function init(pi: ExtensionAPI) {
 
   // 编辑/写入前挂载文件到当前快照（首次编辑即备份编辑前内容）。落盘 appendEntry
   // 让重启后的 hydrate 拿到该文件的跟踪记录；失败不得中断工具执行。
-  pi.on("tool_execution_start", (event, ctx) => {
+  // await 语义是设计基础：pi 的 tool_execution_start 是 await 触发（工具执行会
+  // 等待此 handler 完成），spec 依赖此保证「备份先于编辑写盘完成、无竞态」。
+  // 不可改为 fire-and-forget，否则 stat+copyFile 与工具写盘竞态，大文件下可能
+  // 备份到编辑后内容，恢复时静默错误。
+  pi.on("tool_execution_start", async (event, ctx) => {
     if (!engine) return;
     if (event.toolName !== "edit" && event.toolName !== "write") return;
     const path = (event.args as { path?: unknown } | undefined)?.path;
     if (typeof path !== "string" || path.length === 0) return;
     const cwd = ctx.sessionManager.getCwd();
     const abs = path.startsWith("/") || /^[A-Za-z]:[\\/]/.test(path) ? path : `${cwd}/${path}`;
-    const capturedEngine = engine;
-    void (async () => {
-      try {
-        await capturedEngine.trackEdit(abs);
-        const latest = capturedEngine.getLatest();
-        if (latest) pi.appendEntry(CUSTOM_TYPE, latest);
-      } catch (err) {
-        console.error(`[pi-rewind] trackEdit failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    })();
+    try {
+      await engine.trackEdit(abs);
+      const latest = engine.getLatest();
+      if (latest) pi.appendEntry(CUSTOM_TYPE, latest);
+    } catch (err) {
+      console.error(`[pi-rewind] trackEdit failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   });
 
   pi.registerCommand("rewind", {
