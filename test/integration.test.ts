@@ -57,10 +57,10 @@ describe("event flow", () => {
     await writeFile(file, "V1\n");
     const h = makeEventHarness({ cwd, backupDir });
 
-    await h.onMessageEndUser("u1"); // 快照1：a.ts=V1
+    await h.onMessageEndUser("u1"); // 快照1：a.ts=V1（此时未 trackEdit，files 为空或缺 a.ts）
     await h.onToolExecStart("edit", { path: file }); // 编辑前备份 v1
     await writeFile(file, "V2\n"); // 模拟 edit 落盘
-    await h.onMessageEndUser("u2"); // 快照2：a.ts=V2
+    await h.onMessageEndUser("u2"); // 快照2：a.ts=V2（此时已 trackEdit v1，快照包含 a.ts 备份）
     await h.onToolExecStart("write", { path: file });
     await writeFile(file, "V3\n");
 
@@ -71,11 +71,20 @@ describe("event flow", () => {
     expect(snap1).toBeDefined();
     await h.engine.applySnapshot(snap1!.data as any);
     expect(await readFile(file, "utf-8")).toBe("V1\n");
-    // 快照 2 的 files 自包含：u1 的 a.ts 缺跟踪时由 v1 回退兜底
+    
+    // 快照 2 的 files 自包含：trackEdit 后的版本备份
     const snap2 = h.entriesStore
       .getEntries()
       .find((e) => e.customType === "pi-rewind-snapshot" && (e.data as any).referencedMessageId === "u2");
+    expect(snap2).toBeDefined();
     expect(Object.keys((snap2!.data as any).files).length).toBeGreaterThan(0);
+    // snap2 a.ts 应包含备份版本号（u1 快照后 trackEdit 生成 v1，u2 快照时内容变 V2 再 trackEdit 生成 v2）
+    expect((snap2!.data as any).files["src/a.ts"]).toBeDefined();
+    const snap2FileBackup = (snap2!.data as any).files["src/a.ts"].backup;
+    expect(snap2FileBackup).toMatch(/@v\d+$/);
+    // 实际版本为 v2：编辑后内容变，trackEdit 生成新版本；v1 在 u1 快照时已备份
+    expect(snap2FileBackup).toMatch(/@v2$/);
+    
     await rm(cwd, { recursive: true, force: true });
   });
 });
