@@ -101,11 +101,9 @@ export default function init(pi: ExtensionAPI) {
           getEntries: () => ctx.sessionManager.getEntries() as unknown as RewindSessionEntry[],
         },
         ui: {
-          setEditorText: (text: string) => {
-            // 偏差记录：ExtensionUIContext 无 setEditorText，改用 input() 预填草稿供确认，
-            // 或直接用 sendUserMessage 触发新分支；此处以 notify 提示 + input 预填折中实现。
-            void ctx.ui.input("确认要发起的新提示（可编辑后回车）", text);
-          },
+          // 使用 ExtensionUIContext.setEditorText 把目标消息文本写回主输入编辑器，
+          // 用户可编辑后回车重发形成新分支（spec §7）。
+          setEditorText: (text: string) => ctx.ui.setEditorText(text),
           notify: (msg: string, level: "info" | "warning" | "error") => ctx.ui.notify(msg, level),
         },
       };
