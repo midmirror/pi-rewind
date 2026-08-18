@@ -2,6 +2,7 @@
 import { createHash } from "node:crypto";
 import { copyFile, chmod, mkdir, stat, readdir, rm, readFile, lstat } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { diffLines } from "diff";
 import type { ApplyResult, BackupDesc, DiffStats, SnapshotMeta } from "./types.js";
 
 const MAX_SNAPSHOTS_DEFAULT = 100;
@@ -368,9 +369,54 @@ export class SnapshotEngine {
       for (const d of Object.values(s.files)) if (d.backup) referenced.add(d.backup);
     }
     this.referencedBackups = referenced;
+    void this.cleanOrphans();
   }
 
   async diffStats(meta: SnapshotMeta): Promise<DiffStats | undefined> {
-    throw new Error("Not implemented in Task 4");
+    const filesChanged: string[] = [];
+    let insertions = 0;
+    let deletions = 0;
+    const keys = new Set([...Object.keys(meta.files), ...this.collectAllTrackedKeys()]);
+    await Promise.all(
+      Array.from(keys).map(async (key) => {
+        const abs = toAbsolutePath(this.cwd, key);
+        assertSafeKey(this.cwd, key, abs);
+        const desc = meta.files[key];
+        const v1 = desc === undefined ? this.findFirstVersion(key) : undefined;
+        if (desc === undefined && v1 === undefined) return;
+        const target: string | null =
+          desc === undefined ? (v1 as { backup: string | null }).backup : desc.backup;
+        const [curContent, bakContent] = await Promise.all([
+          readFileSafe(abs),
+          target === null ? null : readFileSafe(join(this.backupDir, target)),
+        ]);
+        if (curContent === null && bakContent === null) return;
+        filesChanged.push(key);
+        if (curContent === bakContent) return; // 内容相同（含两者为 null 已在上行返回）
+        const changes = diffLines(bakContent ?? "", curContent ?? "");
+        for (const c of changes) {
+          if (c.added) insertions += c.count ?? 0;
+          if (c.removed) deletions += c.count ?? 0;
+        }
+      }),
+    );
+    return { filesChanged, insertions, deletions };
+  }
+
+  /** 磁盘清理：删除不被任何现存快照引用的备份文件（prune 后调用） */
+  private async cleanOrphans(): Promise<void> {
+    const referenced = new Set<string>();
+    for (const s of this.snapshots) {
+      for (const d of Object.values(s.files)) if (d.backup) referenced.add(d.backup);
+    }
+    let names: string[];
+    try {
+      names = await readdir(this.backupDir);
+    } catch {
+      return;
+    }
+    await Promise.all(
+      names.filter((n) => !referenced.has(n)).map((n) => rm(join(this.backupDir, n), { force: true })),
+    );
   }
 }

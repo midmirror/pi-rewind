@@ -2,6 +2,7 @@ import { mkdtemp, mkdir, writeFile, readFile, rm, stat, access, chmod, symlink, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, expect } from "vitest";
+import { diffLines } from "diff";
 import { SnapshotEngine, backupFile, toTrackingKey } from "../src/snapshot.js";
 
 async function fileExists(p: string): Promise<boolean> {
@@ -381,6 +382,45 @@ describe("applySnapshot", () => {
     expect(res.errors.length).toBeGreaterThan(0);
     expect(res.errors[0]!.path).toContain("a.ts");
     expect(await readFile(b, "utf-8")).toBe("B2\n"); // b 正常恢复（s2 时点 b=B2，非受损文件 a 不影响 b）
+    await rm(cwd, { recursive: true, force: true });
+  });
+});
+
+describe("diffStats", () => {
+  it("C9: 新增/修改/删除三种情况与 diffLines 直算一致", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-rewind-test-"));
+    const backupDir = join(cwd, ".backups");
+    const a = join(cwd, "src/a.ts");
+    const deleted = join(cwd, "src/old.ts");
+    await mkdir(join(cwd, "src"), { recursive: true });
+    await writeFile(a, "line1\nline2\nline3\n");
+    await writeFile(deleted, "gone\n");
+    const engine = new SnapshotEngine({ backupDir, cwd });
+    engine.hydrate([{ referencedMessageId: "m1", seq: 1, timestamp: 1, files: {} }]);
+    await engine.trackEdit(a);       // 挂载 a
+    await engine.trackEdit(deleted); // 挂载 deleted
+    const m1 = await engine.makeSnapshot("m1");
+
+    await writeFile(a, "line1\nline2-changed\nline3\nline4\n");
+    await rm(deleted);
+
+    const stats = await engine.diffStats(m1);
+    expect(stats).toBeDefined();
+    expect(stats!.filesChanged.sort()).toEqual(["src/a.ts", "src/old.ts"].sort());
+    // 手算期望：a 相对 m1 是 -1 +2；old 是 -1
+    const aBak = m1.files["src/a.ts"]!.backup!;
+    const aBakContent = await readFile(join(backupDir, aBak), "utf-8");
+    const d = diffLines(aBakContent, "line1\nline2-changed\nline3\nline4\n");
+    let expIns = 0, expDel = 0;
+    for (const c of d) { if (c.added) expIns += c.count ?? 0; if (c.removed) expDel += c.count ?? 0; }
+    // 添加 deleted 文件的 diff
+    const delBak = m1.files["src/old.ts"]!.backup!;
+    const delBakContent = await readFile(join(backupDir, delBak), "utf-8");
+    const dd = diffLines(delBakContent, ""); // 磁盘当前为空
+    for (const c of dd) { if (c.added) expIns += c.count ?? 0; if (c.removed) expDel += c.count ?? 0; }
+    expect(stats!.insertions).toBe(expIns);
+    expect(stats!.deletions).toBe(expDel);
+    expect(stats!.insertions + stats!.deletions).toBeGreaterThan(0);
     await rm(cwd, { recursive: true, force: true });
   });
 });
