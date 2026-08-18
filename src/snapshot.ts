@@ -235,10 +235,13 @@ export class SnapshotEngine {
   }
 
   /**
-   * 恢复到给定快照：对"引擎全历史跟踪过的 key"与"目标快照自身记录的 key"的并集逐一处理——
-   * 快照 files 按设计单调累积（一旦某 key 被 trackEdit/makeSnapshot 记录，后续快照的 files
-   * 均会带上该 key），因此 meta.files 中缺失某 key 只可能意味着"该文件在 meta 对应时刻尚未被
-   * 跟踪"——此时正确动作是删除（若现在存在），而非回退到任意版本（C6，场景 B/C 验证）。
+   * 恢复到给定快照（spec §6.3/§10.1 三分支约束）：对"引擎全历史跟踪过的 key"与"目标快照自身
+   * 记录的 key"的并集逐一处理。
+   * - 目标快照 meta.files 中记录该 key → 直接按该记录恢复（restoreTo）。
+   * - 目标快照未记录该 key（desc undefined）→ 查该路径全历史首个记录 v1 = findFirstVersion(key)：
+   *   - v1 === undefined（该路径从未被任何快照跟踪）→ 跳过，不触碰磁盘
+   *   - v1.backup === null（彼时该路径不存在）→ 删除磁盘文件
+   *   - v1.backup 有文件名 → 恢复为 v1 备份内容
    * 目标快照自身携带但引擎历史未曾出现的 key（如外部构造/篡改的 meta）与已跟踪 key 一视同
    * 处理：先做 assertSafeKey + 备份名白名单校验，防绕过 collectAllTrackedKeys 的注入。
    * 单文件失败记入 errors，不中断其他文件（C13）。
@@ -257,8 +260,14 @@ export class SnapshotEngine {
           return;
         }
         const desc = meta.files[key];
-        // 未在 meta 中记录 → 目标时刻尚未跟踪 → 视为彼时不存在（backup:null 语义）
-        await this.restoreTo(abs, desc ?? { backup: null }, result);
+        if (desc !== undefined) {
+          await this.restoreTo(abs, desc, result);
+          return;
+        }
+        // 目标快照未记录该路径 → 回退全历史首个记录（v1，三分支见上方文档）
+        const v1 = this.findFirstVersion(key);
+        if (v1 === undefined) return; // 该路径从未被任何快照跟踪 → 跳过，不触碰磁盘
+        await this.restoreTo(abs, v1, result);
       }),
     );
     return result;
@@ -269,6 +278,19 @@ export class SnapshotEngine {
     const keys = new Set<string>();
     for (const s of this.snapshots) for (const k of Object.keys(s.files)) keys.add(k);
     return keys;
+  }
+
+  /**
+   * 该 key 全历史首个记录（v1）：按 snapshots 数组顺序（最早 → 最新）查找首个含该 key 的记录。
+   * trackEdit 从 v1 起、makeSnapshot 单调递增继承，故首个出现即 v1。
+   * 未找到（该路径从未被任何快照跟踪）返回 undefined。
+   */
+  private findFirstVersion(key: string): BackupDesc | undefined {
+    for (const s of this.snapshots) {
+      const d = s.files[key];
+      if (d !== undefined) return d;
+    }
+    return undefined;
   }
 
   /**

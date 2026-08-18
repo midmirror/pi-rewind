@@ -224,10 +224,11 @@ describe("applySnapshot", () => {
     await engine.trackEdit(b);
     await engine.makeSnapshot("m1");
 
-    // m2 前：删 b.ts、建 c.ts（c 首次编辑，trackEdit 挂到当前快照）
+    // m2 前：删 b.ts、建 c.ts（c 首次编辑；trackEdit 必须先于 writeFile——模拟真实工具
+    // 执行前备份：c.ts 此刻尚不存在 → 记录 v1=backup:null，而非误将创建后内容当 v1）
     await rm(b);
-    await writeFile(join(cwd, "src/c.ts"), "C1\n");
     await engine.trackEdit(join(cwd, "src/c.ts"));
+    await writeFile(join(cwd, "src/c.ts"), "C1\n");
     await engine.makeSnapshot("m2");
 
     // 恢复到 m1：c.ts 应消失（C6），b.ts 恢复 v1（C6/C7）
@@ -312,6 +313,48 @@ describe("applySnapshot", () => {
     };
     const res = await engine.applySnapshot(evil);
     expect(res.errors.length).toBeGreaterThan(0);
+    expect(res.errors[0]!.path).toContain("etc/passwd"); // 被拒的具体路径，而非仅计数
+    await rm(cwd, { recursive: true, force: true });
+  });
+
+  it("场景E C7: 快照后首次编辑的路径回退到未记录该路径的快照,应恢复为v1内容(非删除)", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-rewind-test-"));
+    const backupDir = join(cwd, ".backups");
+    await mkdir(join(cwd, "src"), { recursive: true });
+    const file = join(cwd, "src/e.ts");
+    await writeFile(file, "A\n");
+    const engine = new SnapshotEngine({ backupDir, cwd });
+    engine.hydrate([{ referencedMessageId: "m1", seq: 1, timestamp: 1, files: {} }]);
+    const s1 = await engine.makeSnapshot("m1"); // S1：e.ts 此刻尚未被任何快照跟踪，s1.files 无该 key
+
+    await engine.trackEdit(file); // S1 之后首次编辑：v1 = 编辑前内容 "A\n"
+    await writeFile(file, "B\n");
+    await engine.makeSnapshot("m2"); // v2 = "B\n"
+    await writeFile(file, "C\n");
+    await engine.makeSnapshot("m3"); // 磁盘当前内容 "C\n"，与恢复目标无关
+
+    // 恢复到 S1：e.ts 未在 S1 中记录 → findFirstVersion 回退全历史首个记录 v1="A\n"（非删除）
+    const res = await engine.applySnapshot(s1);
+    expect(res.errors).toEqual([]);
+    expect(await readFile(file, "utf-8")).toBe("A\n");
+    await rm(cwd, { recursive: true, force: true });
+  });
+
+  it("C6: 快照显式记录 backup:null,磁盘现存文件应被删除", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-rewind-test-"));
+    const backupDir = join(cwd, ".backups");
+    await mkdir(join(cwd, "src"), { recursive: true });
+    const file = join(cwd, "src/f.ts");
+    const engine = new SnapshotEngine({ backupDir, cwd });
+    engine.hydrate([{ referencedMessageId: "m1", seq: 1, timestamp: 1, files: {} }]);
+    await engine.trackEdit(file); // file 尚不存在 → 显式记录 backup:null
+    const s1 = engine.getLatest()!;
+    expect(s1.files[toTrackingKey(cwd, file)]?.backup).toBeNull();
+
+    await writeFile(file, "LATER\n"); // 快照之后磁盘才出现该文件
+    const res = await engine.applySnapshot(s1);
+    expect(res.errors).toEqual([]);
+    expect(await fileExists(file)).toBe(false);
     await rm(cwd, { recursive: true, force: true });
   });
 
