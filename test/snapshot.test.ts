@@ -14,8 +14,7 @@ async function fixture() {
 describe("trackEdit", () => {
   it("C1: 备份内容 == 编辑前磁盘内容", async () => {
     const cleanup = await fixture();
-    const tmpDir = await mkdtemp(join(tmpdir(), "pi-rewind-test-"));
-    const cwd = tmpDir;
+    const cwd = await mkdtemp(join(tmpdir(), "pi-rewind-test-"));
     const backupDir = join(cwd, ".backups");
     const file = join(cwd, "src/a.ts");
     await mkdir(join(cwd, "src"), { recursive: true });
@@ -30,12 +29,13 @@ describe("trackEdit", () => {
     expect(desc!.backup).toMatch(/^[0-9a-f]{16}@v1$/);
     const bak = await readFile(join(backupDir, desc!.backup!), "utf-8");
     expect(bak).toBe("content-A1\n");
-    await rm(tmpDir, { recursive: true, force: true });
+    await rm(cwd, { recursive: true, force: true });
+    await cleanup();
   });
 
-  it("C2+C3: 同快snapshot내重复편집불重复備份（v1 單调）", async () => {
-    const tmpDir = await mkdtemp(join(tmpdir(), "pi-rewind-test-"));
-    const cwd = tmpDir;
+  it("C2+C3: 同快照内重复编辑不重复备份（v1 单调）", async () => {
+    const cleanup = await fixture();
+    const cwd = await mkdtemp(join(tmpdir(), "pi-rewind-test-"));
     const backupDir = join(cwd, ".backups");
     await mkdir(backupDir, { recursive: true });
     const file = join(cwd, "src/b.ts");
@@ -51,12 +51,13 @@ describe("trackEdit", () => {
     await engine.trackEdit(file); // 幂等：仍 v1
     const s1b = engine.getLatest()!;
     expect(s1b.files[toTrackingKey(cwd, file)]?.backup).toBe(s1.files[toTrackingKey(cwd, file)]?.backup);
-    await rm(tmpDir, { recursive: true, force: true });
+    await rm(cwd, { recursive: true, force: true });
+    await cleanup();
   });
 
   it("C15: 跨会话版本隔离——新引擎对同文件不覆盖旧会话备份", async () => {
-    const tmpDir = await mkdtemp(join(tmpdir(), "pi-rewind-test-"));
-    const cwd = tmpDir;
+    const cleanup = await fixture();
+    const cwd = await mkdtemp(join(tmpdir(), "pi-rewind-test-"));
     const backupDir = join(cwd, ".backups");
     await mkdir(backupDir, { recursive: true });
     const file = join(cwd, "src/cross.ts");
@@ -81,12 +82,13 @@ describe("trackEdit", () => {
     const vBContent = await readFile(join(backupDir, vB), "utf-8");
     expect(vAContent).toBe("V1\n");
     expect(vBContent).toBe("V2\n");
-    await rm(tmpDir, { recursive: true, force: true });
+    await rm(cwd, { recursive: true, force: true });
+    await cleanup();
   });
 
   it("C4: 源文件不存在 → backup:null 无异常", async () => {
-    const tmpDir = await mkdtemp(join(tmpdir(), "pi-rewind-test-"));
-    const cwd = tmpDir;
+    const cleanup = await fixture();
+    const cwd = await mkdtemp(join(tmpdir(), "pi-rewind-test-"));
     const backupDir = join(cwd, ".backups");
     await mkdir(backupDir, { recursive: true });
     const engine = new SnapshotEngine({ backupDir, cwd });
@@ -95,12 +97,13 @@ describe("trackEdit", () => {
     await engine.trackEdit(join(cwd, "nope.ts"));
     const desc = engine.getLatest()!.files[toTrackingKey(cwd, join(cwd, "nope.ts"))!];
     expect(desc!.backup).toBeNull();
-    await rm(tmpDir, { recursive: true, force: true });
+    await rm(cwd, { recursive: true, force: true });
+    await cleanup();
   });
 
   it("C11: .git/ 下与超大文件不跟踪", async () => {
-    const tmpDir = await mkdtemp(join(tmpdir(), "pi-rewind-test-"));
-    const cwd = tmpDir;
+    const cleanup = await fixture();
+    const cwd = await mkdtemp(join(tmpdir(), "pi-rewind-test-"));
     const backupDir = join(cwd, ".backups");
     await mkdir(backupDir, { recursive: true });
     const engine = new SnapshotEngine({ backupDir, cwd, maxFileSizeBytes: 10 });
@@ -116,12 +119,13 @@ describe("trackEdit", () => {
     await writeFile(big, "this-is-more-than-10-bytes");
     await engine.trackEdit(big);
     expect(engine.getLatest()!.files[toTrackingKey(cwd, big)]).toBeUndefined();
-    await rm(tmpDir, { recursive: true, force: true });
+    await rm(cwd, { recursive: true, force: true });
+    await cleanup();
   });
 
   it("C12+C14: 相对 key 与特殊字符路径", async () => {
-    const tmpDir = await mkdtemp(join(tmpdir(), "pi-rewind-test-"));
-    const cwd = tmpDir;
+    const cleanup = await fixture();
+    const cwd = await mkdtemp(join(tmpdir(), "pi-rewind-test-"));
     const backupDir = join(cwd, ".backups");
     await mkdir(backupDir, { recursive: true });
     
@@ -134,6 +138,7 @@ describe("trackEdit", () => {
     engine.hydrate([{ referencedMessageId: "m1", seq: 1, timestamp: 1, files: {} }]);
     await engine.trackEdit(weird);
     expect(engine.getLatest()!.files["notes/中文 文件.txt"]).toBeDefined();
-    await rm(tmpDir, { recursive: true, force: true });
+    await rm(cwd, { recursive: true, force: true });
+    await cleanup();
   });
 });
