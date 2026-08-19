@@ -49,3 +49,45 @@ pi 对 `tool_execution_start` 的扩展 emit 是 `await`（工具执行等待 ha
 
 - 判定法：持久化 RPC 会话里 `prompt "/rewind --dry-run"`，输出「无可回退」= 命令已注册；`agent_start:false` = 未被丢给 LLM。`get_commands` 在 RPC 下不可靠（`--no-session` 返回 0），不要用它判定加载。
 - 教训：加载问题用「命令是否被拦截」实测，而非命令列表 API。
+
+## 8. 版本号分配路径分裂 → 跨会话覆盖（C15 引申）
+
+全局扁平备份目录下，版本号唯一性必须**每处**都扫磁盘。曾修好 `trackEdit` 与 null 分支用 `maxExistingVersion+1`，却漏了 `makeSnapshot` 的 changed 分支——它按 `desc @vN+1` 取版本。跨会话：B 引用旧 v，磁盘已到更高版本，B 内容一变就写覆盖他人备份。re-read 时发现同文件三种分配法两种不一致。
+
+- 修复：changed 分支统一 `version = max(descV+1, maxExistingVersion+1)`。
+- 教训："全局共享名空间"的并发唯一性，是所有写版本路径（trackEdit / makeSnapshot 各分支）的**共同不变量**；审查时逐条核对，别只修一处。补的跨会话测试要逼出「desc 落后磁盘」场景，单靠同会话单调递增测不出。
+
+## 9. mtime 相等也须比对内容 + utimes 微秒陷阱
+
+快照变化检测曾用 `cur.mtimeMs > bak.mtimeMs` 才读内容、相等直接判未变；CC 语义是 `mtimeMs < bak` 才短路归「未变」，相等/更新须读内容。保留 mtime 的写入（rsync / `cp -p` / patch）内容变了、时间戳相等 → 漏检。另：测「mtime 相等」时用 `utimes(file, bakStat.atime, bakStat.mtime)` 不可靠——`utimes` 传 Date 会**丢微秒**，取得比备份略小的整毫秒，反被引擎按「早于备份=未变」跳过，制造假阴性。
+
+- 修复：统一 CC 语义（`<` 跳、相等比对）。测试用同一整数毫秒 `Date` 严格同时设置源与备份 mtime 才能锁定「相等仍比对」。
+- 教训：时钟是比对的退化信号，mtime 相等≠未变；构造边界测试要考虑 fs 时间戳精度截断。
+
+## 10. 持久化 emit 该反映「快照是否真变」
+
+`trackEdit` 后无条件 `pi.appendEntry(CUSTOM_TYPE, latest)`，即使幂等 / `.git` / 超大文件跳过（未改快照）。同会话内存因 replace 末尾不积聚，但落盘会留重复 custom entry；重启 hydrate 载入全部重复条目，下次 `makeSnapshot` 的 `slice(-100)` 按**条目数**而非消息数淘汰 → 编辑密集会话最早的消息快照被挤出，`getSnapshotById` 返回 undefined，旧点静默失去代码回退。
+
+- 修复：`trackEdit` 返回 `boolean`（是否实际改快照），仅真时落盘。
+- 教训："每次编辑都持久化"与"LRU 上限按条目跑"叠加会悄悄丢历史。持久化 emit 要语义化（是否真正变更），别图省事无条件写。
+
+## 11. mkdir 的 mode 只对新建目录生效
+
+`mkdir(dir, { mode: 0o700 })` 不会修正**已存在**目录的权限。备份目录一旦由旧版本 / umask 残留成 0755，本机其他用户可读全部被编辑源码/凭据。隐私锚点不能靠 mkdir 一次。
+
+- 修复：init 时 `mkdir` 后显式 `chmod(dir, 0o700)` 幂等。
+- 教训：权限保证要看「目录已存在」的幂等路径，不能只覆盖创建路径。
+
+## 12. 恢复只查最终组件 symlink → 中间目录写穿
+
+`restoreTo` 只对目标最终组件 `lstat` + unlink。键形如 `link/passwd`（cwd 内 `link` → `/etc` 的目录符号链接，dotfiles 把 `~/.ssh`、`~/.config` 链进 cwd 是常见布局）时，`lstat` 返回真实文件 stat，`copyFile` / `rm` 沿中间目录链接**写穿到 cwd 外真实文件**，破坏"恢复只触碰 cwd 内"不变量。
+
+- 修复：新增 `assertNoParentSymlink`——相对 key 的目标父目录 `realpath` 后若相对 `realpath(cwd)` 以 `..` 开头，拒绝该文件的恢复/删除。绝对 key（cwd 外文件）为设计内合法，跳过。
+- 教训：符号链接防护要覆盖**整条父链**，不是只有最终组件；真实路径解析用 `fs/promises.realpath`，别混 `path.resolve`（纯字符串不解析链接）。
+
+## 13. `Promise.all` 逐元素回调必须整体 try/catch
+
+`applySnapshot` 曾对 `Promise.all(...map(async key => ...))` 的内部只 try 了 `assertSafeKey`，`restoreTo` 里的 symlink unlink 等裸 `await` 一抛 → reject 整棵 Promise → rewind 全盘中止，其余文件不恢复（违背 C13 "单文件失败不中断"）。
+
+- 修复：恢复 / 快照 `Promise.all` 的每个元素整体 try/catch，失败记 errors 继续。
+- 教训：『逐文件隔离』承诺只在「每个文件自身一层完整 try/catch」时才成立；把部分 try 留在外层是假隔离。
