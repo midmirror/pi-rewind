@@ -119,10 +119,16 @@ async function applyRestore(
   out: (s: string) => void,
 ): Promise<void> {
   const result: { changed?: string[]; errors?: { path: string; error: string }[] } = {};
-  if (snap && (opts.mode === "code" || opts.mode === "both")) {
+  const wantCode = opts.mode === "code" || opts.mode === "both";
+  if (snap && wantCode) {
     const res = await deps.engine.applySnapshot(snap);
     result.changed = res.changed;
     result.errors = res.errors;
+  } else if (wantCode && !snap) {
+    // 快照不存在（被淘汰/引擎未捕获）→ 显式提示，避免输出伪装成「无代码变化」的成功
+    result.errors = [
+      { path: "(snapshot)", error: "该回退点无可用快照（可能已被 maxSnapshots 淘汰）。代码未回退。" },
+    ];
   }
   if (opts.mode === "conversation" || opts.mode === "both") {
     await runSessionRestore(deps.ctx, ref);

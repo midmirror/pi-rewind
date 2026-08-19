@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, writeFile, readFile, rm, stat, access, chmod, symlink, lstat } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, readFile, rm, stat, access, chmod, symlink, lstat, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, expect } from "vitest";
@@ -468,5 +468,163 @@ describe("diffStats", () => {
     expect(stats!.deletions).toBe(expDel);
     expect(stats!.insertions + stats!.deletions).toBeGreaterThan(0);
     await rm(cwd, { recursive: true, force: true });
+  });
+
+  it("回归#9: 内容与目标备份一致的文件不计入 filesChanged", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-rewind-test-"));
+    const backupDir = join(cwd, ".backups");
+    const a = join(cwd, "src/keep.ts");
+    await mkdir(join(cwd, "src"), { recursive: true });
+    await writeFile(a, "SAME\n");
+    const engine = new SnapshotEngine({ backupDir, cwd });
+    engine.hydrate([{ referencedMessageId: "m1", seq: 1, timestamp: 1, files: {} }]);
+    await engine.trackEdit(a);
+    const m1 = await engine.makeSnapshot("m1");
+    const stats = await engine.diffStats(m1);
+    expect(stats!.filesChanged).toEqual([]);
+    expect(stats!.insertions + stats!.deletions).toBe(0);
+    await rm(cwd, { recursive: true, force: true });
+  });
+});
+
+describe("回归修复", () => {
+  it("回归#1: makeSnapshot 变化分支跨会话不覆盖他人备份（版本扫盘）", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-rewind-test-"));
+    const backupDir = join(cwd, ".backups");
+    const file = join(cwd, "src/x.ts");
+    const key = toTrackingKey(cwd, file);
+    await mkdir(join(cwd, "src"), { recursive: true });
+    await writeFile(file, "A1\n");
+    // 会话 A 产生 v1
+    const engineA = new SnapshotEngine({ backupDir, cwd });
+    engineA.hydrate([{ referencedMessageId: "m1", seq: 1, timestamp: 1, files: {} }]);
+    await engineA.trackEdit(file);
+    const vA1 = engineA.getLatest()!.files[key]!.backup!;
+    expect(vA1).toMatch(/@v1$/);
+    // 手动制造磁盘 v2、v3，模拟其它会话已写入（B 的 desc 落后于磁盘）
+    const base = vA1.split("@v")[0] + "@v";
+    await writeFile(join(backupDir, base + "2"), "V2\n");
+    await writeFile(join(backupDir, base + "3"), "V3\n");
+    // 会话 B：仅引用 v1（旧），磁盘已到 v3。内容变化后 makeSnapshot 必须避让到 v4——
+    // 旧 bug 变化分支按 desc@vN+1 算版本会写 v2，恰好覆盖他人 v2 备份。
+    const engineB = new SnapshotEngine({ backupDir, cwd });
+    engineB.hydrate([{ referencedMessageId: "n1", seq: 1, timestamp: 1, files: { [key]: { backup: vA1 } } }]);
+    await writeFile(file, "B2\n");
+    const sB = await engineB.makeSnapshot("n2");
+    const vB = sB.files[key]!.backup!;
+    expect(vB).toMatch(/@v4$/);
+    // 他人 v2/v3 未被覆盖
+    expect(await readFile(join(backupDir, base + "2"), "utf-8")).toBe("V2\n");
+    expect(await readFile(join(backupDir, base + "3"), "utf-8")).toBe("V3\n");
+    expect(await readFile(join(backupDir, vB), "utf-8")).toBe("B2\n");
+    await rm(cwd, { recursive: true, force: true });
+  });
+
+  it("回归#2: trackEdit 返回是否实际变更（幂等 false / 首次 true）", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-rewind-test-"));
+    const backupDir = join(cwd, ".backups");
+    const file = join(cwd, "src/a.ts");
+    await mkdir(join(cwd, "src"), { recursive: true });
+    await writeFile(file, "V1\n");
+    const engine = new SnapshotEngine({ backupDir, cwd });
+    engine.hydrate([{ referencedMessageId: "m1", seq: 1, timestamp: 1, files: {} }]);
+    expect(await engine.trackEdit(file)).toBe(true);
+    expect(await engine.trackEdit(file)).toBe(false);
+    const gitFile = join(cwd, ".git/config");
+    await mkdir(join(cwd, ".git"), { recursive: true });
+    await writeFile(gitFile, "x");
+    expect(await engine.trackEdit(gitFile)).toBe(false);
+    await rm(cwd, { recursive: true, force: true });
+  });
+
+  it("回归#6: 内容变但 mtime 相等仍检出变化（保留 mtime 写入不泄漏）", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-rewind-test-"));
+    const backupDir = join(cwd, ".backups");
+    const file = join(cwd, "src/t.ts");
+    await mkdir(join(cwd, "src"), { recursive: true });
+    await writeFile(file, "A1\n");
+    const engine = new SnapshotEngine({ backupDir, cwd });
+    engine.hydrate([{ referencedMessageId: "m1", seq: 1, timestamp: 1, files: {} }]);
+    await engine.trackEdit(file);
+    const m1 = await engine.makeSnapshot("m1");
+    const key6 = toTrackingKey(cwd, file);
+    const bakV1 = join(backupDir, m1.files[key6]!.backup!);
+    // 用同一整数毫秒 Date 严格同时设置源与备份的 mtime：utimes 传 Date 会丢微秒，
+    // 若取 bakStat.mtime 会得到比备份略小的整毫秒 → 引擎按「早于备份=未变」跳过，
+    // 无法构造「相等」场景。固定 T 保证两边严格相等，才能锁定「相等仍比对内容」逻辑。
+    const T = new Date("2020-01-01T00:00:00Z");
+    await utimes(bakV1, T, T);
+    await writeFile(file, "A2\n");
+    await utimes(file, T, T);
+    const m2 = await engine.makeSnapshot("m2");
+    expect(m2.files[key6]!.backup).toMatch(/@v2$/);
+    await rm(cwd, { recursive: true, force: true });
+  });
+
+  it("回归#8+prune: cleanOrphans 保留引用备份与非引擎文件", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-rewind-test-"));
+    const backupDir = join(cwd, ".backups");
+    const file = join(cwd, "src/y.ts");
+    await mkdir(join(cwd, "src"), { recursive: true });
+    await writeFile(file, "Y\n");
+    const engine = new SnapshotEngine({ backupDir, cwd, maxSnapshots: 3 });
+    engine.hydrate([{ referencedMessageId: "init", seq: 1, timestamp: 1, files: {} }]);
+    await engine.trackEdit(file);
+    const refBackup = engine.getLatest()!.files[toTrackingKey(cwd, file)]!.backup!;
+    await writeFile(join(backupDir, "aaaa11112222bbbb@v99"), "orphan");
+    await writeFile(join(backupDir, "not-a-backup-file.txt"), "foreign");
+    for (let i = 0; i < 4; i++) await engine.makeSnapshot("m" + i);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(await fileExists(join(backupDir, refBackup))).toBe(true);
+    expect(await fileExists(join(backupDir, "not-a-backup-file.txt"))).toBe(true);
+    await rm(cwd, { recursive: true, force: true });
+  });
+
+  it("回归: hydrate 往返保真（序列化→持久化→重建引擎）", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-rewind-test-"));
+    const backupDir = join(cwd, ".backups");
+    const file = join(cwd, "src/h.ts");
+    await mkdir(join(cwd, "src"), { recursive: true });
+    await writeFile(file, "H\n");
+    const src = new SnapshotEngine({ backupDir, cwd });
+    src.hydrate([{ referencedMessageId: "m1", seq: 1, timestamp: 1, files: {} }]);
+    await src.trackEdit(file);
+    const m2 = await src.makeSnapshot("m2");
+    const persisted = JSON.parse(JSON.stringify(src.snapshotsList));
+    const dst = new SnapshotEngine({ backupDir, cwd });
+    dst.hydrate(persisted);
+    expect(dst.getSnapshotSeqs()).toEqual([1, 2]);
+    expect(dst.getSnapshotById("m2")).toBeDefined();
+    expect(dst.getSnapshotById("m2")!.files[toTrackingKey(cwd, file)]!.backup).toMatch(/@v1$/);
+    const m3 = await dst.makeSnapshot("m3");
+    expect(m3.seq).toBe(3);
+    await rm(cwd, { recursive: true, force: true });
+  });
+
+  it("回归R2#2: 父链目录 symlink 写穿被拒绝，外部真实文件不受影响", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-rewind-test-"));
+    const backupDir = join(cwd, ".backups");
+    // 外部真实目录（不在 cwd 内）
+    const outside = await mkdtemp(join(tmpdir(), "pi-rewind-outside-"));
+    await writeFile(join(outside, "victim.txt"), "SENSITIVE\n");
+    // cwd/src 内建 linkdir → 指向外部目录的符号链接（模拟 dotfiles 把 ~/.ssh 链进 cwd）
+    const src = join(cwd, "src");
+    await mkdir(src, { recursive: true });
+    await symlink(outside, join(src, "linkdir"));
+    const engine = new SnapshotEngine({ backupDir, cwd });
+    engine.hydrate([]);
+    // 恶意/异常快照：相对 key 写在链路下、backup:null（本会删除）——父链逃逸须拒绝
+    const evil: any = {
+      referencedMessageId: "evil",
+      seq: 1,
+      timestamp: 1,
+      files: { "src/linkdir/victim.txt": { backup: null } },
+    };
+    const res = await engine.applySnapshot(evil);
+    expect(res.errors.length).toBeGreaterThan(0);
+    expect(res.errors[0]!.path).toContain("victim.txt");
+    expect(await readFile(join(outside, "victim.txt"), "utf-8")).toBe("SENSITIVE\n"); // 未写穿删除
+    await rm(cwd, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
   });
 });

@@ -76,11 +76,13 @@ export function makeEventHarness(opts: { cwd: string; backupDir: string }) {
     },
     async onToolExecStart(toolName: string, args: { path: string }) {
       if (toolName === "edit" || toolName === "write") {
-        await engine.trackEdit(args.path);
-        toolTracked.push(args.path);
-        // 对齐 index.ts H4 接线：trackEdit 后落盘最新自包含快照 entry
-        const latest = engine.getLatest();
-        if (latest) entriesStore.appendCustomEntry("pi-rewind-snapshot", latest);
+        const changed = await engine.trackEdit(args.path);
+        if (changed) {
+          toolTracked.push(args.path);
+          // 对齐 index.ts 接线：仅当快照实际被修改才落盘 entry
+          const latest = engine.getLatest();
+          if (latest) entriesStore.appendCustomEntry("pi-rewind-snapshot", latest);
+        }
       }
     },
     getToolTracked: () => toolTracked,

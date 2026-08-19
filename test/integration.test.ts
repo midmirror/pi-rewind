@@ -46,6 +46,35 @@ describe("session integration", () => {
     expect(navigations).toEqual([]); // 未导航
     expect(notifications.some((n) => n.includes("/tree"))).toBe(true);
   });
+
+  it("navigate 被取消（session_before_tree 钩子）：不导航不改动会话", async () => {
+    const entries: SessionEntry[] = [
+      userEntry("u1", null, "first"),
+      assistantEntry("a1", "u1"),
+      userEntry("u2", "a1", "second"),
+    ];
+    const editorText: string[] = [];
+    const notifications: string[] = [];
+    const navigations: unknown[] = [];
+    const ctx = {
+      navigate: async (targetId: string | null) => {
+        navigations.push(targetId);
+        return { cancelled: true }; // 模拟 session_before_tree 取消
+      },
+      sessionManager: {
+        getLeafEntry: () => entries.at(-1) as { id: string } | undefined,
+        getEntries: () => entries as never,
+      },
+      ui: {
+        setEditorText: (t: string) => editorText.push(t),
+        notify: (m: string) => notifications.push(m),
+      },
+    };
+    await runSessionRestore(ctx, { entryId: "u2", text: "second", parentId: "a1" });
+    expect(navigations).toEqual(["a1"]); // 尝试导航
+    expect(editorText).toEqual([]);      // 取消后不回填
+    expect(notifications).toEqual([]);   // 取消后不发跳转确认
+  });
 });
 
 describe("event flow", () => {

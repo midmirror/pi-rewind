@@ -1,6 +1,6 @@
 // index.ts — pi-rewind 扩展入口
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { mkdir } from "node:fs/promises";
+import { mkdir, chmod } from "node:fs/promises";
 import path from "node:path";
 import { SnapshotEngine } from "./src/snapshot.js";
 import type { SessionEntry as RewindSessionEntry, RestoreContext } from "./src/session.js";
@@ -16,7 +16,16 @@ export default function init(pi: ExtensionAPI) {
 
   const home = process.env.HOME || process.env.USERPROFILE || "";
   const backupDir = `${home}/.pi/agent/pi-rewind/backups`;
-  void mkdir(backupDir, { recursive: true, mode: 0o700 }).catch(() => {});
+  // mkdir 的 mode 仅对「新建」目录生效；已存在目录（旧版本/umask 残留）必须显式 chmod 修正，
+  // 否则备份目录可能残留 0755，本机其他用户可读全部被编辑源码/凭据（隐私锚点）。
+  void (async () => {
+    try {
+      await mkdir(backupDir, { recursive: true, mode: 0o700 });
+      await chmod(backupDir, 0o700);
+    } catch {
+      /* best-effort */
+    }
+  })();
 
   pi.on("session_start", (_event, ctx) => {
     sessionId = ctx.sessionManager.getSessionId();
@@ -72,9 +81,13 @@ export default function init(pi: ExtensionAPI) {
     const abs =
       filePath.startsWith("/") || /^[A-Za-z]:[\\/]/.test(filePath) ? filePath : path.join(cwd, filePath);
     try {
-      await engine.trackEdit(abs);
-      const latest = engine.getLatest();
-      if (latest) pi.appendEntry(CUSTOM_TYPE, latest);
+      const changed = await engine.trackEdit(abs);
+      // 仅当快照实际被修改才落盘：幂等/sizeOver/.git 跳过时不 emit，避免重复条目
+      // 在重启 hydrate 后挤占 maxSnapshots 淘汰预算（旧消息失去恢复点）。
+      if (changed) {
+        const latest = engine.getLatest();
+        if (latest) pi.appendEntry(CUSTOM_TYPE, latest);
+      }
     } catch (err) {
       console.error(`[pi-rewind] trackEdit failed: ${err instanceof Error ? err.message : String(err)}`);
     }

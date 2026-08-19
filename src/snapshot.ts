@@ -1,6 +1,6 @@
 // src/snapshot.ts
 import { createHash } from "node:crypto";
-import { copyFile, chmod, mkdir, stat, readdir, rm, readFile, lstat } from "node:fs/promises";
+import { copyFile, chmod, mkdir, stat, readdir, rm, readFile, lstat, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { diffLines } from "diff";
 import type { ApplyResult, BackupDesc, DiffStats, SnapshotMeta } from "./types.js";
@@ -39,8 +39,11 @@ export async function backupFile(
   let srcStats;
   try {
     srcStats = await stat(filePath);
-  } catch {
-    return null; // 源不存在 → null 标记
+  } catch (err: unknown) {
+    // 仅源不存在（ENOENT）才记 null 标记；EACCES 等其它错误必须向上抛，由调用方隔离，否则
+    // 存在但不可读的文件会被误记为「彼时不存在」，恢复时 rm 误删真实文件（Critical 锚点）。
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw err;
   }
   const name = backupFileName(filePath, version);
   const target = join(backupDir, name);
@@ -69,6 +72,26 @@ function assertSafeKey(cwd: string, key: string, abs: string): void {
   if (resolved !== cwdResolved && !resolved.startsWith(cwdResolved + "/")) {
     throw new Error(`unsafe key: ${key}`);
   }
+}
+
+/**
+ * 防父链符号链接写穿：相对 key 的目标父目录经 realpath 后若逃出 cwd（cwd 内存在指向外部的
+ * 目录链接，如 dotfiles 方案把 ~/.ssh、~/.config 链接进 cwd），则拒绝恢复/删除，避免覆写或
+ * 删除链接指向的真实外部文件。绝对 key（cwd 外文件）为设计内合法（toTrackingKey 语义），跳过。
+ */
+async function assertNoParentSymlink(cwd: string, key: string, abs: string): Promise<void> {
+  if (isAbsolute(key)) return;
+  let realDir: string;
+  try {
+    realDir = await realpath(dirname(abs));
+  } catch {
+    return; // 目录尚不存在，交由 copyFile 递归创建，无写穿风险
+  }
+  const realCwd = await realpath(cwd);
+  const rel = relative(realCwd, realDir);
+  if (rel === "" || rel === ".") return; // realDir == realCwd
+  if (!rel.startsWith("..")) return;      // 无 `..` 前缀 → 仍在 cwd 内，安全
+  throw new Error(`parent dir escapes cwd via symlink: ${key}`);
 }
 
 /** 读取文件为字符串；失败（缺失/权限等）返回 null，供内容比对时统一处理。 */
@@ -151,15 +174,21 @@ export class SnapshotEngine {
     return this.referencedBackups;
   }
 
-  async trackEdit(filePath: string): Promise<void> {
+  /**
+   * 编辑前挂载文件到当前快照（首次编辑即备份编辑前内容）。
+   * @returns true=快照实际被修改（应 appendEntry 持久化）；false=无变化（幂等/越过）不应落盘。
+   *         用于避免「每次编辑都 append 整份 latest」造成重启 hydrate 后重复条目
+   *         挤占 maxSnapshots 淘汰预算（见决策：仅变更才落盘）。
+   */
+  async trackEdit(filePath: string): Promise<boolean> {
     const key = toTrackingKey(this.cwd, filePath);
     const latest = this.snapshots.at(-1);
-    if (!latest) return; // 尚无快照，无从挂载（首个用户消息的快照会先建）
+    if (!latest) return false; // 尚无快照，无从挂载（首个用户消息的快照会先建）
     // 幂等跳过条件：已跟踪且非 null。null 记录（彼时文件不存在）必须继续走备份流程重评估，
     // 否则文件被创建后 null 状态永久卡死，恢复该点之后的快照会误删已创建文件（Critical 修复）。
     // 注意：未跟踪（undefined）不能命中这个跳过条件，否则失去首次备份。
     const existing = latest.files[key];
-    if (existing !== undefined && existing.backup !== null) return;
+    if (existing !== undefined && existing.backup !== null) return false;
 
     let sizeOver = false;
     if (this.maxFileSizeBytes > 0) {
@@ -170,7 +199,7 @@ export class SnapshotEngine {
         // 源缺失 → sizeOver 保持 false，交给 backupFile 记 null
       }
     }
-    if (isInsideGitDir(filePath) || sizeOver) return;
+    if (isInsideGitDir(filePath) || sizeOver) return false;
 
     // 版本号以磁盘为准（C15）：扫描备份目录现存同文件 hash 的最大 v，防跨会话覆盖
     const nextVersion = await maxExistingVersion(this.backupDir, filePath) + 1;
@@ -181,6 +210,7 @@ export class SnapshotEngine {
       files: { ...latest.files, [key]: { backup: backupName } },
     };
     this.snapshots[this.snapshots.length - 1] = updated;
+    return true;
   }
 
   /**
@@ -195,40 +225,56 @@ export class SnapshotEngine {
       await Promise.all(
         Object.entries(prev.files).map(async ([key, desc]) => {
           const abs = toAbsolutePath(this.cwd, key);
-          if (desc.backup === null) {
-            // null 记录不可直接沿用：磁盘现状可能已变化（文件后来被创建）。
-            // 重新评估磁盘：存在 → 补建真实备份（版本号以 maxExistingVersion 扫描为准，通常 v1）；
-            // 仍不存在 → 保持 null（Critical 修复：防止 null 永久卡死导致恢复时误删文件）。
-            const nextVersion = (await maxExistingVersion(this.backupDir, abs)) + 1;
-            const name = await backupFile(abs, this.backupDir, nextVersion);
-            files[key] = { backup: name };
-            return;
-          }
-          const bakPath = join(this.backupDir, desc.backup);
-          let changed = false;
-          try {
-            const [cur, bak] = await Promise.all([stat(abs), stat(bakPath)]);
-            if (cur.mode !== bak.mode || cur.size !== bak.size) {
-              changed = true;
-            } else if (cur.mtimeMs > bak.mtimeMs) {
-              // mtime 早于备份时间可短路跳过内容比对（同 CC checkOriginFileChanged 语义）；
-              // 否则仍需读内容确认（mtime 更新但内容可能相同）
-              const [c, b] = await Promise.all([readFileSafe(abs), readFileSafe(bakPath)]);
-              changed = c !== b;
-            }
-          } catch {
-            // 源或备份缺失（如源被删除）→ 视为变化，交由下方分支处理
-            changed = true;
-          }
-          if (!changed) {
+          const overSize = await this.isOverSize(abs);
+          if (overSize) {
+            // 超大文件：不重读/重备份，沿用 desc（避免大文件全量入堆拖慢快照）
             files[key] = desc;
             return;
           }
-          // 源文件可能已被删除：backupFile 对缺失源返回 null，语义与 trackEdit 一致
-          const m = desc.backup.match(/@v(\d+)$/);
-          const version = m ? Number(m[1]) + 1 : 1;
-          const name = await backupFile(abs, this.backupDir, version);
-          files[key] = { backup: name };
+          try {
+            if (desc.backup === null) {
+              // null 记录不可直接沿用：磁盘现状可能已变化（文件后来被创建）。
+              // 重新评估磁盘：存在 → 补建真实备份（版本号以 maxExistingVersion 扫描为准，通常 v1）；
+              // 仍不存在 → 保持 null（Critical 修复：防止 null 永久卡死导致恢复时误删文件）。
+              const nextVersion = (await maxExistingVersion(this.backupDir, abs)) + 1;
+              const name = await backupFile(abs, this.backupDir, nextVersion);
+              files[key] = { backup: name };
+              return;
+            }
+            const bakPath = join(this.backupDir, desc.backup);
+            let changed = false;
+            try {
+              const [cur, bak] = await Promise.all([stat(abs), stat(bakPath)]);
+              if (cur.mode !== bak.mode || cur.size !== bak.size) {
+                changed = true;
+              } else if (cur.mtimeMs < bak.mtimeMs) {
+                // mtime 早于备份时间可短路跳过（同 CC checkOriginFileChanged：只有早于备份才确定未变）；
+                // 相等或更新都无法保证内容未变，必须读内容确认（否则保留 mtime 的写入会被漏检）
+                changed = false;
+              } else {
+                const [c, b] = await Promise.all([readFileSafe(abs), readFileSafe(bakPath)]);
+                changed = c !== b;
+              }
+            } catch {
+              // 源或备份缺失（如源被删除）→ 视为变化，交由下方分支处理
+              changed = true;
+            }
+            if (!changed) {
+              files[key] = desc;
+              return;
+            }
+            // 源文件可能已被删除：backupFile 对缺失源返回 null，语义与 trackEdit 一致
+            // 版本号以磁盘为准（C15）且须大于当前 desc 版本：防跨会话覆盖他人备份，也防退化
+            const m = desc.backup.match(/@v(\d+)$/);
+            const descV = m ? Number(m[1]) : 1;
+            const nextVersion = (await maxExistingVersion(this.backupDir, abs)) + 1;
+            const version = Math.max(descV + 1, nextVersion);
+            const name = await backupFile(abs, this.backupDir, version);
+            files[key] = { backup: name };
+          } catch {
+            // 单文件备份失败（如 EACCES/源突然被删）→ 沿用 desc，保留跟踪不丢，不中断整条快照（C13）
+            files[key] = desc;
+          }
         }),
       );
     }
@@ -265,19 +311,20 @@ export class SnapshotEngine {
         const abs = toAbsolutePath(this.cwd, key);
         try {
           assertSafeKey(this.cwd, key, abs);
+          await assertNoParentSymlink(this.cwd, key, abs);
+          const desc = meta.files[key];
+          if (desc !== undefined) {
+            await this.restoreTo(abs, desc, result);
+            return;
+          }
+          // 目标快照未记录该路径 → 回退全历史首个记录（v1，三分支见上方文档）
+          const v1 = this.findFirstVersion(key);
+          if (v1 === undefined) return; // 该路径从未被任何快照跟踪 → 跳过，不触碰磁盘
+          await this.restoreTo(abs, v1, result);
         } catch (err) {
+          // 单文件恢复失败隔离（C13）：含 symlink unlink、copyFile、rm 等任意异常，不中断其他文件
           result.errors.push({ path: key, error: err instanceof Error ? err.message : String(err) });
-          return;
         }
-        const desc = meta.files[key];
-        if (desc !== undefined) {
-          await this.restoreTo(abs, desc, result);
-          return;
-        }
-        // 目标快照未记录该路径 → 回退全历史首个记录（v1，三分支见上方文档）
-        const v1 = this.findFirstVersion(key);
-        if (v1 === undefined) return; // 该路径从未被任何快照跟踪 → 跳过，不触碰磁盘
-        await this.restoreTo(abs, v1, result);
       }),
     );
     return result;
@@ -378,7 +425,10 @@ export class SnapshotEngine {
       for (const d of Object.values(s.files)) if (d.backup) referenced.add(d.backup);
     }
     this.referencedBackups = referenced;
-    void this.cleanOrphans();
+    // fire-and-forget 必须接 .catch：rm 可因 EACCES/EPERM reject，未处理则 Node≥15 默认 unhandledRejection 崩进程
+    void this.cleanOrphans().catch((e) => {
+      console.error(`[pi-rewind] cleanOrphans failed: ${e instanceof Error ? e.message : String(e)}`);
+    });
   }
 
   async diffStats(meta: SnapshotMeta): Promise<DiffStats | undefined> {
@@ -388,24 +438,35 @@ export class SnapshotEngine {
     const keys = new Set([...Object.keys(meta.files), ...this.collectAllTrackedKeys()]);
     await Promise.all(
       Array.from(keys).map(async (key) => {
-        const abs = toAbsolutePath(this.cwd, key);
-        assertSafeKey(this.cwd, key, abs);
-        const desc = meta.files[key];
-        const v1 = desc === undefined ? this.findFirstVersion(key) : undefined;
-        if (desc === undefined && v1 === undefined) return;
-        const target: string | null =
-          desc === undefined ? (v1 as { backup: string | null }).backup : desc.backup;
-        const [curContent, bakContent] = await Promise.all([
-          readFileSafe(abs),
-          target === null ? null : readFileSafe(join(this.backupDir, target)),
-        ]);
-        if (curContent === null && bakContent === null) return;
-        filesChanged.push(key);
-        if (curContent === bakContent) return; // 内容相同（含两者为 null 已在上行返回）
-        const changes = diffLines(bakContent ?? "", curContent ?? "");
-        for (const c of changes) {
-          if (c.added) insertions += c.count ?? 0;
-          if (c.removed) deletions += c.count ?? 0;
+        try {
+          // 逐键容错 + 与 restoreTo 对称的白名单校验，防单个不安全 key 弄挂整个 /rewind 预览
+          const abs = toAbsolutePath(this.cwd, key);
+          assertSafeKey(this.cwd, key, abs);
+          await assertNoParentSymlink(this.cwd, key, abs);
+          const desc = meta.files[key];
+          const v1 = desc === undefined ? this.findFirstVersion(key) : undefined;
+          if (desc === undefined && v1 === undefined) return;
+          const target: string | null =
+            desc === undefined ? (v1 as { backup: string | null }).backup : desc.backup;
+          if (target !== null && !BACKUP_NAME_RE.test(target)) return;
+          // 超大文件跳过，避免整读入堆 + diffLines(O(ND)) 阻塞事件循环
+          if (await this.isOverSize(abs)) return;
+          if (target !== null && (await this.isOverSize(join(this.backupDir, target)))) return;
+          const [curContent, bakContent] = await Promise.all([
+            readFileSafe(abs),
+            target === null ? null : readFileSafe(join(this.backupDir, target)),
+          ]);
+          if (curContent === null && bakContent === null) return;
+          // 内容相同（含两者为 null）不计为变化——filesChanged 必须只在确有差异时累加
+          if (curContent === bakContent) return;
+          filesChanged.push(key);
+          const changes = diffLines(bakContent ?? "", curContent ?? "");
+          for (const c of changes) {
+            if (c.added) insertions += c.count ?? 0;
+            if (c.removed) deletions += c.count ?? 0;
+          }
+        } catch {
+          // 单 key 失败跳过，不中断其它 key 的统计
         }
       }),
     );
@@ -425,7 +486,27 @@ export class SnapshotEngine {
       return;
     }
     await Promise.all(
-      names.filter((n) => !referenced.has(n)).map((n) => rm(join(this.backupDir, n), { force: true })),
+      names
+        // 只删本引擎生成的备份名，绝不触碰备份目录内其它文件（BACKUP_NAME_RE 白名单）
+        .filter((n) => BACKUP_NAME_RE.test(n) && !referenced.has(n))
+        .map(async (n) => {
+          try {
+            await rm(join(this.backupDir, n), { force: true });
+          } catch (e) {
+            console.error(`[pi-rewind] remove orphan backup failed: ${e instanceof Error ? e.message : String(e)}`);
+          }
+        }),
     );
+  }
+
+  /** maxFileSizeBytes 上限检查；超限返回 true（跳过读取/重备份，防大文件全量入堆）。 */
+  private async isOverSize(abs: string): Promise<boolean> {
+    if (this.maxFileSizeBytes <= 0) return false;
+    try {
+      const st = await stat(abs);
+      return st.size > this.maxFileSizeBytes;
+    } catch {
+      return false; // 源缺失等 → 交由具体分支处理
+    }
   }
 }
