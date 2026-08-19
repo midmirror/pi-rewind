@@ -216,4 +216,38 @@ describe("executeRewind", () => {
     expect(done!).toContain("(snapshot)"); // 显式提示快照缺失，非空 errors
     await rm(cwd, { recursive: true, force: true });
   });
+
+  it("菜单差异标注为语义格式：增N行/删M行/K文件", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-rw-cmd-"));
+    const backupDir = join(cwd, ".backups");
+    const file = join(cwd, "src/a.ts");
+    await mkdir(join(cwd, "src"), { recursive: true });
+    await writeFile(file, "A1\n");
+    const engine = new SnapshotEngine({ backupDir, cwd });
+    await engine.makeSnapshot("u1");
+    await engine.trackEdit(file);   // u1 快照挂 v1=A1
+    await writeFile(file, "A2\n");
+    await engine.makeSnapshot("u2"); // v2=A2
+    await writeFile(file, "A3\n");
+    const entries: SessionEntry[] = [
+      userEntry("u1", null, "改 a.ts"),
+      userEntry("u2", "u1", "再改"),
+    ];
+    const { ctx } = makeContext(entries);
+    const selected: string[] = [];
+    await executeRewind(
+      {
+        engine, entries, ctx,
+        select: async (items: string[]) => { selected.push(...items); return 0; },
+        confirm: async () => true,
+      },
+      { target: { kind: "last" }, mode: "both", confirm: false, dryRun: false },
+    );
+    // u2 快照(v2=A2) vs 磁盘(A3)：增1行/删1行/1文件；u1 快照(v1=A1) vs A3：增1行/删2行? ——
+    // 内容差异由 diffLines 决定，这里只断言格式符合「增/删/文件」三段语义，不锁具体行数
+    for (const s of selected) {
+      expect(s).toMatch(/增\d+行\/删\d+行\/\d+文件/);
+    }
+    await rm(cwd, { recursive: true, force: true });
+  });
 });

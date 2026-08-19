@@ -1,7 +1,7 @@
 // src/command.ts
 import { SnapshotEngine } from "./snapshot.js";
 import { SessionEntry, getSelectableUserEntries, runSessionRestore, RestoreContext } from "./session.js";
-import { UserMessageRef } from "./types.js";
+import { DiffStats, UserMessageRef } from "./types.js";
 
 export interface RewindOptions {
   target: { kind: "last" } | { kind: "at"; value: string };
@@ -85,7 +85,7 @@ export async function executeRewind(deps: RewindDeps, opts: RewindOptions): Prom
     const chosenStats = chosenSnap ? await deps.engine.diffStats(chosenSnap) : undefined;
     const has = !!chosenStats && (chosenStats.insertions + chosenStats.deletions + chosenStats.filesChanged.length) > 0;
     confirmed = await deps.confirm(
-      `恢复至「${chosen.text.slice(0, 50)}」？` + (has ? ` 文件变化 +${chosenStats!.insertions} -${chosenStats!.deletions}` : " 无代码变化") +
+      `恢复至「${chosen.text.slice(0, 50)}」？` + ` ${formatDiffLabel(chosenStats)}` +
       (has ? "\n⚠ bash/手动编辑的改动不受影响，不会被回滚。" : ""),
     );
     if (!confirmed) { out(JSON.stringify({ type: "rewind-cancelled" })); return; }
@@ -106,9 +106,15 @@ async function refsToMenu(deps: RewindDeps): Promise<string[]> {
   return Promise.all(refs.map(async (r) => {
     const snap = deps.engine.getSnapshotById(r.entryId);
     const stats = snap ? await deps.engine.diffStats(snap) : undefined;
-    const diff = stats && stats.filesChanged.length > 0 ? ` +${stats.insertions} -${stats.deletions} (${stats.filesChanged.length}f)` : " 无代码变化";
+    const diff = ` ${formatDiffLabel(stats)}`;
     return `${r.text.slice(0, 50).replace(/\n/g, " ")}${diff}`;
   }));
+}
+
+/** 差异标注的语义化文案：`增N行/删M行/K文件`；无变化或不可用时返回 `无代码变化`。 */
+function formatDiffLabel(stats: DiffStats | undefined): string {
+  if (!stats || stats.filesChanged.length === 0) return "无代码变化";
+  return `增${stats.insertions}行/删${stats.deletions}行/${stats.filesChanged.length}文件`;
 }
 
 async function applyRestore(
