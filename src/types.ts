@@ -32,4 +32,6 @@ export interface UserMessageRef {
   text: string;
   /** 该消息的父 entry id（恢复时 branch 的目标） */
   parentId: string | null;
+  /** 用户消息 entry 的时间戳（毫秒）。菜单排序辅助键：时间倒序优先，缺失/相等回退 seq 倒序 */
+  timestamp: number;
 }

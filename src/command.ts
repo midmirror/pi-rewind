@@ -78,7 +78,8 @@ export async function executeRewind(deps: RewindDeps, opts: RewindOptions): Prom
     const items = await refsToMenu(deps);
     const idx = await deps.select(items, "Rewind to which point? (↑/↓ 选择, Enter 确认)");
     if (idx === undefined) { out(JSON.stringify({ type: "rewind-cancelled" })); return; }
-    const menuRefs = getSelectableUserEntries(deps.entries);
+    // 菜单用倒序 refs（最近在上方），idx 必须映射到同一份列表，否则选中的是错位条目
+    const menuRefs = getMenuRefs(deps);
     const chosen = menuRefs[idx];
     if (!chosen) return;
     const chosenSnap = deps.engine.getSnapshotById(chosen.entryId);
@@ -101,20 +102,48 @@ export async function executeRewind(deps: RewindDeps, opts: RewindOptions): Prom
   await applyRestore(deps, ref, snap, opts, out);
 }
 
-async function refsToMenu(deps: RewindDeps): Promise<string[]> {
+/** 交互菜单用：可回退用户消息，最近的检查点排在最上方。
+ * 排序：timestamp 倒序为主（缺失记 0，排最末），相等回退 seq 倒序（时间分辨率不足/无时间戳时
+ * 保序）。seq 取快照 seq（seq=0 表示无快照，排最末）。返回数组倒序后保持 `--at N` 数字寻址正序不变。 */
+function getMenuRefs(deps: RewindDeps): UserMessageRef[] {
   const refs = getSelectableUserEntries(deps.entries);
+  return refs
+    .map((r) => {
+      const snap = deps.engine.getSnapshotById(r.entryId);
+      return { ref: r, seq: snap?.seq ?? 0 };
+    })
+    .sort((a, b) => b.ref.timestamp - a.ref.timestamp || b.seq - a.seq)
+    .map((x) => x.ref);
+}
+
+async function refsToMenu(deps: RewindDeps): Promise<string[]> {
+  const refs = getMenuRefs(deps);
   return Promise.all(refs.map(async (r) => {
     const snap = deps.engine.getSnapshotById(r.entryId);
     const stats = snap ? await deps.engine.diffStats(snap) : undefined;
     const diff = ` ${formatDiffLabel(stats)}`;
-    return `${r.text.slice(0, 50).replace(/\n/g, " ")}${diff}`;
+    return `${formatMenuTime(r.timestamp)}${r.text.slice(0, 50).replace(/\n/g, " ")}${diff}`;
   }));
 }
 
-/** 差异标注的语义化文案：`增N行/删M行/K文件`；无变化或不可用时返回 `无代码变化`。 */
+/** 菜单行时间前缀：`[MM-DD HH:MM] `；跨年加年份 `[YYYY-MM-DD HH:MM] `；timestamp 缺失（0）不显示前缀，避免误导。 */
+function formatMenuTime(ts: number): string {
+  if (!ts) return "";
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return "";
+  const p = (n: number) => String(n).padStart(2, "0");
+  const mm = p(d.getMonth() + 1);
+  const dd = p(d.getDate());
+  const hh = p(d.getHours());
+  const mi = p(d.getMinutes());
+  const sameYear = d.getFullYear() === new Date().getFullYear();
+  return sameYear ? `[${mm}-${dd} ${hh}:${mi}] ` : `[${d.getFullYear()}-${mm}-${dd} ${hh}:${mi}] `;
+}
+
+/** 差异标注的语义化文案：`[增N行/删M行/K文件]`；无变化或不可用时返回 `[无代码变化]`。 */
 function formatDiffLabel(stats: DiffStats | undefined): string {
-  if (!stats || stats.filesChanged.length === 0) return "无代码变化";
-  return `增${stats.insertions}行/删${stats.deletions}行/${stats.filesChanged.length}文件`;
+  if (!stats || stats.filesChanged.length === 0) return "[无代码变化]";
+  return `[增${stats.insertions}行/删${stats.deletions}行/${stats.filesChanged.length}文件]`;
 }
 
 async function applyRestore(

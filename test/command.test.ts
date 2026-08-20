@@ -7,8 +7,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { makeContext } from "./harness.js";
 
-function userEntry(id: string, parentId: string | null, text: string): SessionEntry {
-  return { id, parentId, type: "message", message: { role: "user", content: [{ type: "text", text }] } };
+function userEntry(id: string, parentId: string | null, text: string, timestamp?: string): SessionEntry {
+  return { id, parentId, type: "message", timestamp, message: { role: "user", content: [{ type: "text", text }] } };
 }
 
 describe("parseArgv", () => {
@@ -244,10 +244,111 @@ describe("executeRewind", () => {
       { target: { kind: "last" }, mode: "both", confirm: false, dryRun: false },
     );
     // u2 快照(v2=A2) vs 磁盘(A3)：增1行/删1行/1文件；u1 快照(v1=A1) vs A3：增1行/删2行? ——
-    // 内容差异由 diffLines 决定，这里只断言格式符合「增/删/文件」三段语义，不锁具体行数
+    // 内容差异由 diffLines 决定，这里只断言格式符合「[增/删/文件]」三段语义，不锁具体行数
     for (const s of selected) {
-      expect(s).toMatch(/增\d+行\/删\d+行\/\d+文件/);
+      expect(s).toMatch(/\[增\d+行\/删\d+行\/\d+文件\]/);
     }
+    await rm(cwd, { recursive: true, force: true });
+  });
+
+  it("交互菜单检查点倒序：最近的在上方", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-rw-cmd-"));
+    const backupDir = join(cwd, ".backups");
+    const file = join(cwd, "src/a.ts");
+    await mkdir(join(cwd, "src"), { recursive: true });
+    await writeFile(file, "A1\n");
+    const engine = new SnapshotEngine({ backupDir, cwd });
+    await engine.makeSnapshot("u1");
+    await engine.trackEdit(file);
+    await writeFile(file, "A2\n");
+    await engine.makeSnapshot("u2");
+    await writeFile(file, "A3\n");
+    const entries: SessionEntry[] = [
+      userEntry("u1", null, "改 a.ts"),
+      userEntry("u2", "u1", "再改"),
+    ];
+    const { ctx } = makeContext(entries);
+    const selected: string[] = [];
+    await executeRewind(
+      {
+        engine, entries, ctx,
+        select: async (items: string[]) => { selected.push(...items); return 0; },
+        confirm: async () => true,
+      },
+      { target: { kind: "last" }, mode: "both", confirm: false, dryRun: false },
+    );
+    // 菜单倒序：u2（最近）在上，u1 在下；选中 idx 0 即最近的 u2 → 回滚到 v2=A2
+    expect(selected[0]).toContain("再改");
+    expect(selected[1]).toContain("改 a.ts");
+    expect(await readFile(file, "utf-8")).toBe("A2\n");
+    await rm(cwd, { recursive: true, force: true });
+  });
+
+  it("菜单按时间戳倒序：时间新在上方，与 seq 无关", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-rw-cmd-"));
+    const backupDir = join(cwd, ".backups");
+    const file = join(cwd, "src/a.ts");
+    await mkdir(join(cwd, "src"), { recursive: true });
+    await writeFile(file, "A1\n");
+    const engine = new SnapshotEngine({ backupDir, cwd });
+    // u1 时间新但 seq 小（先入引擎），u2 时间旧但 seq 大 → 排序应时间优先
+    engine.hydrate([{ referencedMessageId: "u1", seq: 1, timestamp: 3000, files: {} }]);
+    await engine.makeSnapshot("u1");
+    await engine.trackEdit(file);
+    await writeFile(file, "A2\n");
+    await engine.makeSnapshot("u2");
+    await writeFile(file, "A3\n");
+    const entries: SessionEntry[] = [
+      userEntry("u1", null, "先发", "2026-08-20T10:05:00.000Z"),
+      userEntry("u2", "u1", "后发", "2026-08-20T10:06:00.000Z"),
+    ];
+    const { ctx } = makeContext(entries);
+    const selected: string[] = [];
+    await executeRewind(
+      {
+        engine, entries, ctx,
+        select: async (items: string[]) => { selected.push(...items); return 0; },
+        confirm: async () => true,
+      },
+      { target: { kind: "last" }, mode: "both", confirm: false, dryRun: false },
+    );
+    // 时间倒序：u2（后发）在上；即使 u2 seq 更大，也保持时间序
+    expect(selected[0]).toContain("后发");
+    expect(selected[1]).toContain("先发");
+    // 菜单行带时间前缀 `[MM-DD HH:MM] `
+    expect(selected[0]).toMatch(/^\[\d{2}-\d{2} \d{2}:\d{2}\] /);
+    await rm(cwd, { recursive: true, force: true });
+  });
+
+  it("无时间戳时回退 seq 倒序（时间分辨率不足也保序）", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-rw-cmd-"));
+    const backupDir = join(cwd, ".backups");
+    const file = join(cwd, "src/a.ts");
+    await mkdir(join(cwd, "src"), { recursive: true });
+    await writeFile(file, "A1\n");
+    const engine = new SnapshotEngine({ backupDir, cwd });
+    await engine.makeSnapshot("u1");
+    await engine.trackEdit(file);
+    await writeFile(file, "A2\n");
+    await engine.makeSnapshot("u2");
+    await writeFile(file, "A3\n");
+    const entries: SessionEntry[] = [
+      userEntry("u1", null, "改 a.ts"),
+      userEntry("u2", "u1", "再改"),
+    ];
+    const { ctx } = makeContext(entries);
+    const selected: string[] = [];
+    await executeRewind(
+      {
+        engine, entries, ctx,
+        select: async (items: string[]) => { selected.push(...items); return 0; },
+        confirm: async () => true,
+      },
+      { target: { kind: "last" }, mode: "both", confirm: false, dryRun: false },
+    );
+    // 无时间戳 → timestamp=0 全部相等 → seq 倒序（u2 seq 2 > u1 seq 1）
+    expect(selected[0]).toContain("再改");
+    expect(selected[1]).toContain("改 a.ts");
     await rm(cwd, { recursive: true, force: true });
   });
 });

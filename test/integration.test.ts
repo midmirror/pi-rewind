@@ -6,8 +6,8 @@ import { makeContext, makeEventHarness } from "./harness.js";
 import { getSelectableUserEntries, runSessionRestore } from "../src/session.js";
 import type { SessionEntry } from "../src/session.js";
 
-function userEntry(id: string, parentId: string | null, text: string): SessionEntry {
-  return { id, parentId, type: "message", message: { role: "user", content: [{ type: "text", text }] } };
+function userEntry(id: string, parentId: string | null, text: string, timestamp?: string): SessionEntry {
+  return { id, parentId, type: "message", timestamp, message: { role: "user", content: [{ type: "text", text }] } };
 }
 function assistantEntry(id: string, parentId: string): SessionEntry {
   return { id, parentId, type: "message", message: { role: "assistant", content: [{ type: "text", text: "reply" }] } };
@@ -33,7 +33,7 @@ describe("session integration", () => {
       userEntry("u2", "a1", "second prompt"),
     ];
     const { ctx, getLeafId, editorText, navigations } = makeContext(entries);
-    await runSessionRestore(ctx, { entryId: "u2", text: "second prompt", parentId: "a1" });
+    await runSessionRestore(ctx, { entryId: "u2", text: "second prompt", parentId: "a1", timestamp: 0 });
     expect(navigations).toEqual(["a1"]);
     expect(getLeafId()).toBe("a1");
     expect(editorText).toEqual(["second prompt"]);
@@ -42,7 +42,7 @@ describe("session integration", () => {
   it("首条消息 parentId=null：不导航，提示手动 /tree", async () => {
     const entries: SessionEntry[] = [userEntry("u1", null, "only prompt")];
     const { ctx, navigations, notifications } = makeContext(entries);
-    await runSessionRestore(ctx, { entryId: "u1", text: "only prompt", parentId: null });
+    await runSessionRestore(ctx, { entryId: "u1", text: "only prompt", parentId: null, timestamp: 0 });
     expect(navigations).toEqual([]); // 未导航
     expect(notifications.some((n) => n.includes("/tree"))).toBe(true);
   });
@@ -70,7 +70,7 @@ describe("session integration", () => {
         notify: (m: string) => notifications.push(m),
       },
     };
-    await runSessionRestore(ctx, { entryId: "u2", text: "second", parentId: "a1" });
+    await runSessionRestore(ctx, { entryId: "u2", text: "second", parentId: "a1", timestamp: 0 });
     expect(navigations).toEqual(["a1"]); // 尝试导航
     expect(editorText).toEqual([]);      // 取消后不回填
     expect(notifications).toEqual([]);   // 取消后不发跳转确认

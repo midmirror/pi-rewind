@@ -7,6 +7,8 @@ export interface SessionEntry {
   id: string;
   parentId: string | null;
   type: string;
+  /** entry 时间戳：ISO 字符串（pi SessionManager 写入），缺省时 new Date(undefined) = Invalid Date */
+  timestamp?: string;
   message?: { role: string; content: unknown };
   customType?: string;
   data?: unknown;
@@ -51,7 +53,8 @@ export function getSelectableUserEntries(entries: SessionEntry[]): UserMessageRe
     const text = extractText(e.message.content);
     if (!text) continue;
     if (NON_USER_TEXT_MARKERS.some((m) => text.includes(m))) continue;
-    refs.push({ entryId: e.id, text, parentId: e.parentId });
+    const ts = new Date(e.timestamp ?? "").getTime();
+    refs.push({ entryId: e.id, text, parentId: e.parentId, timestamp: Number.isNaN(ts) ? 0 : ts });
   }
   return refs;
 }

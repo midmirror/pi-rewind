@@ -1,5 +1,24 @@
 # CHANGELOG — pi-rewind
 
+## [0.3.0] — 2026-08-20
+
+菜单可用性升级：检查点按时间倒序（最近在上方）+ 时间戳显示 + 差异标注中括号化。测试 41→45。
+
+### Added
+- **菜单时间排序**：交互菜单按用户消息 `timestamp` 倒序（最近在上），次键快照 `seq` 倒序（时间缺失/相等时保序）。`SessionEntry.timestamp`（ISO 字符串）解析为毫秒，缺失记 0 排最末。
+- **菜单时间显示**：每行 `[MM-DD HH:MM] 消息摘要 [diff]` 前缀；跨年显示 `[YYYY-MM-DD HH:MM]` 防歧义；无时间戳不显示前缀。
+
+### Changed
+- 菜单 diff 标注中括号化：`增N行/删M行/K文件` → `[增N行/删M行/K文件]`，`无代码变化` → `[无代码变化]`（与时间前缀格式统一）。
+- `UserMessageRef` 增加 `timestamp` 字段（毫秒，排序辅助键）。
+- `package.json` version `0.2.0` → `0.3.0`。
+
+### Fixed
+- **交互菜单选中错位**：`executeRewind` 用正序 `getSelectableUserEntries` 取选中项，而菜单项已是倒序 → idx 映射错位选中别的检查点。改为菜单与选中映射共用 `getMenuRefs`。
+
+### Tests
+- 4 新增：菜单倒序（最近在上）、时间戳倒序（与 seq 无关）、无时间戳回退 seq 倒序、菜单时间前缀 `[MM-DD HH:MM]` 渲染。
+
 ## [0.2.0] — 2026-08-19
 
 Review 强化版：四路只读 sub-agent 审查（意图回归 / 安全隐私 / 性能可靠 / 契约覆盖）+ 修复全部 H/M 登记问题，测试 29→41。参考实现 `claude-code-source/utils/fileHistory.ts` 语义对齐。
